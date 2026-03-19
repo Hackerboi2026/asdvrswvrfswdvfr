@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # ==============================================================================
-# Network Scanner Script for eno1 and VLAN Interfaces
+# Network Scanner Script for eno1 and VLAN Interfaces (ARP-ONLY)
 # ==============================================================================
-# Purpose: Comprehensive network discovery for authorized pentesting
+# Purpose: Network discovery using arp-scan for authorized pentesting
 # Author: HackerAI Assistant
 # Date: 2026-03-19
 # Target: 95.216.241.0/26 network via eno1 and VLAN subinterfaces
@@ -11,7 +11,7 @@
 
 # Configuration
 TARGET_NETWORK="95.216.241.0/26"
-# Try to use static binary, fallback to system arp-scan
+# Use local static binary if available, otherwise fallback to system arp-scan
 ARP_SCAN_BIN="./arp-scan" 
 OUTPUT_DIR="./scan_results"
 LOG_FILE="$OUTPUT_DIR/scan_$(date +%Y%m%d_%H%M%S).log"
@@ -60,7 +60,7 @@ check_privileges() {
 
 # Check for required tools
 check_tools() {
-    local tools=("nmap" "ip" "ping")
+    local tools=("ip" "bash")
     local missing=()
     
     for tool in "${tools[@]}"; do
@@ -71,17 +71,27 @@ check_tools() {
     
     if [ ${#missing[@]} -gt 0 ]; then
         print_error "Missing required tools: ${missing[*]}"
-        print_warning "Please install: sudo apt update && sudo apt install -y nmap iputils-ping"
         exit 1
     fi
     
     # Check for arp-scan (either system or static binary)
-    if ! command -v "arp-scan" &> /dev/null && [ ! -f "$ARP_SCAN_BIN" ]; then
-        print_warning "arp-scan not found. Installing system version..."
+    if [ -f "$ARP_SCAN_BIN" ]; then
+        print_success "Found static arp-scan binary at $ARP_SCAN_BIN"
+    elif command -v "arp-scan" &> /dev/null; then
+        print_success "Found system arp-scan"
+        ARP_SCAN_BIN="arp-scan" # Override to use system binary
+    else
+        print_warning "arp-scan not found. Please install it (sudo apt install arp-scan) or place a static binary at ./arp-scan"
+        print_warning "Attempting to install system arp-scan..."
         sudo apt update && sudo apt install -y arp-scan
+        if command -v "arp-scan" &> /dev/null; then
+            ARP_SCAN_BIN="arp-scan"
+            print_success "System arp-scan installed."
+        else
+            print_error "Failed to install arp-scan. Exiting."
+            exit 1
+        fi
     fi
-    
-    print_success "All required tools available"
 }
 
 # Get interface information
@@ -102,21 +112,21 @@ get_interface_info() {
     print_success "Interface information saved to $OUTPUT_DIR/interfaces.txt"
 }
 
-# ARP Scanning Functions
-scan_with_arp_scan() {
+# Helper to run arp-scan
+run_arp_scan() {
     local interface="$1"
     local network="$2"
     local output_file="$3"
     
+    # Determine binary to use
+    local binary="$ARP_SCAN_BIN"
+    if [ ! -f "$ARP_SCAN_BIN" ] && [ "$ARP_SCAN_BIN" = "arp-scan" ]; then
+        binary="arp-scan"
+    fi
+    
     print_header "Starting ARP scan on $interface ($network)..."
     
-    if [ -f "$ARP_SCAN_BIN" ]; then
-        # Use static binary
-        "$ARP_SCAN_BIN" --interface="$interface" "$network" > "$output_file" 2>&1
-    else
-        # Use system arp-scan
-        arp-scan --interface="$interface" "$network" > "$output_file" 2>&1
-    fi
+    "$binary" --interface="$interface" "$network" > "$output_file" 2>&1
     
     local result=$?
     if [ $result -eq 0 ]; then
@@ -131,28 +141,6 @@ scan_with_arp_scan() {
     fi
 }
 
-scan_with_nmap() {
-    local interface="$1"
-    local network="$2"
-    local output_file="$3"
-    
-    print_header "Starting nmap scan on $interface ($network)..."
-    
-    # Fast host discovery with ARP
-    nmap -sn -PR -e "$interface" "$network" > "$output_file" 2>&1
-    
-    local result=$?
-    if [ $result -eq 0 ]; then
-        print_success "Nmap host discovery completed on $interface"
-        # Display discovered hosts
-        echo "=== Nmap Host Discovery Results ===" >> "$LOG_FILE"
-        grep -E "Nmap scan report for|Host is up" "$output_file" >> "$LOG_FILE"
-        grep -E "Nmap scan report for|Host is up" "$output_file"
-    else
-        print_error "Nmap scan failed on $interface (exit code: $result)"
-    fi
-}
-
 # Target-specific scanning
 scan_eno1() {
     local interface="eno1"
@@ -160,13 +148,9 @@ scan_eno1() {
     
     print_header "Scanning $interface ($ip/32)..."
     
-    # Single host scan
+    # Single host scan (ARP request for specific IP)
     local output_file="$OUTPUT_DIR/eno1_single_host.txt"
-    nmap -Pn -p- "$ip" > "$output_file" 2>&1
-    
-    echo "=== Single Host Scan Results ===" >> "$LOG_FILE"
-    grep -E "Nmap scan report for|open|filtered|closed" "$output_file" >> "$LOG_FILE"
-    grep -E "Nmap scan report for|open|filtered|closed" "$output_file"
+    run_arp_scan "$interface" "$ip" "$output_file"
 }
 
 scan_vlan_interfaces() {
@@ -176,33 +160,19 @@ scan_vlan_interfaces() {
     # All VLAN interfaces share the same /26 network
     local network="$base_ip$netmask"
     
-    print_header "Scanning VLAN network $network via all interfaces..."
+    print_header "Scanning VLAN network $network via eno1..."
     
     # Scan with ARP
     local arp_output="$OUTPUT_DIR/vlan_arp_scan.txt"
-    if [ -f "$ARP_SCAN_BIN" ]; then
-        "$ARP_SCAN_BIN" --interface=eno1 "$network" > "$arp_output" 2>&1
-    else
-        arp-scan --interface=eno1 "$network" > "$arp_output" 2>&1
-    fi
-    
-    # Also try nmap for additional discovery
-    local nmap_output="$OUTPUT_DIR/vlan_nmap_scan.txt"
-    nmap -sn -PR "$network" > "$nmap_output" 2>&1
-    
-    echo "=== VLAN Network ARP Scan Results ===" >> "$LOG_FILE"
-    grep -E "^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" "$arp_output" >> "$LOG_FILE"
-    
-    echo "=== VLAN Network Nmap Discovery Results ===" >> "$LOG_FILE"
-    grep -E "Nmap scan report for" "$nmap_output" >> "$LOG_FILE"
+    run_arp_scan "eno1" "$network" "$arp_output"
     
     # Display summary
     echo ""
     print_header "VLAN Network Scan Summary:"
     echo "  Network: $network"
     echo "  Active hosts found:"
-    echo "    ARP scan: $(grep -E "^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" "$arp_output" | grep -v "192.168" | wc -l) hosts"
-    echo "    Nmap discovery: $(grep -E "Nmap scan report for" "$nmap_output" | wc -l) hosts"
+    local count=$(grep -E "^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" "$arp_output" | grep -v "192.168" | wc -l)
+    echo "    ARP scan: $count hosts"
 }
 
 # Comprehensive network analysis
@@ -219,14 +189,7 @@ comprehensive_analysis() {
     echo "" >> "$analysis_file"
     
     # ARP scan
-    if [ -f "$ARP_SCAN_BIN" ]; then
-        "$ARP_SCAN_BIN" --interface=eno1 "$network" >> "$analysis_file" 2>&1
-    else
-        arp-scan --interface=eno1 "$network" >> "$analysis_file" 2>&1
-    fi
-    
-    # Nmap host discovery
-    nmap -sn -PR "$network" >> "$analysis_file" 2>&1
+    run_arp_scan "eno1" "$network" "$analysis_file"
     
     # Display summary
     echo ""
@@ -236,11 +199,9 @@ comprehensive_analysis() {
     
     # Count discovered hosts
     local arp_count=$(grep -E "^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" "$analysis_file" | grep -v "192.168" | wc -l)
-    local nmap_count=$(grep -E "Nmap scan report for" "$analysis_file" | wc -l)
     
     echo "  Discovered hosts:"
     echo "    ARP scan: $arp_count hosts"
-    echo "    Nmap discovery: $nmap_count hosts"
 }
 
 # Generate report
@@ -251,7 +212,7 @@ generate_report() {
     
     cat > "$report_file" << EOF
 ================================================================================
-NETWORK PENTESTING SCAN REPORT
+NETWORK PENTESTING SCAN REPORT (ARP-ONLY)
 ================================================================================
 Date: $TIMESTAMP
 Target Network: 95.216.241.0/26
@@ -263,12 +224,12 @@ SCAN RESULTS SUMMARY
 ================================================================================
 
 1. ENO1 SINGLE HOST SCAN (95.216.241.236/32)
-   - Method: Nmap port scan
+   - Method: ARP Request
    - Output: $OUTPUT_DIR/eno1_single_host.txt
 
 2. VLAN NETWORK SCAN (95.216.241.192/26)
-   - Methods: ARP scan, Nmap host discovery
-   - Output: $OUTPUT_DIR/vlan_arp_scan.txt, $OUTPUT_DIR/vlan_nmap_scan.txt
+   - Method: ARP Scan
+   - Output: $OUTPUT_DIR/vlan_arp_scan.txt
 
 3. COMPREHENSIVE ANALYSIS
    - Full /26 network scan
@@ -281,7 +242,7 @@ SCAN RESULTS SUMMARY
 NEXT STEPS
 ================================================================================
 1. Review the detailed scan results in the output files
-2. Identify active hosts and open ports
+2. Identify active hosts based on ARP responses
 3. Perform targeted vulnerability scanning on discovered hosts
 4. Document findings in your pentest report
 
@@ -302,7 +263,7 @@ EOF
 # Main execution function
 main() {
     echo "=============================================================================="
-    echo "Network Scanner for eno1 and VLAN Interfaces"
+    echo "Network Scanner for eno1 and VLAN Interfaces (ARP-ONLY)"
     echo "Authorized Pentesting Tool"
     echo "=============================================================================="
     echo ""
